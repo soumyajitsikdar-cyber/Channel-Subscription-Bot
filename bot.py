@@ -1,5 +1,3 @@
-# Improved Telegram Subscription Bot (Production Ready)
-
 import os
 import time
 import telebot
@@ -17,11 +15,9 @@ app = Flask('')
 def home():
     return "Bot is running!"
 
-
 def run_web():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
 
 def keep_alive():
     Thread(target=run_web).start()
@@ -44,7 +40,6 @@ users_col.create_index([("expiry", 1)])
 users_col.create_index([("user_id", 1), ("channel_id", 1)])
 
 # --- UTIL ---
-
 def format_time(mins):
     mins = int(mins)
     if mins < 60:
@@ -55,7 +50,6 @@ def format_time(mins):
         return f"{mins//1440} Days"
 
 # --- START ---
-
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
@@ -83,21 +77,19 @@ def start_handler(message):
                 reply_markup=markup
             )
             return
-        except:
-            pass
+        except Exception as e:
+            print(e)
 
     if user_id == ADMIN_ID:
-        bot.send_message(user_id, "/add - Add Channel\n/channels - Manage")
+        bot.send_message(user_id, "/add - Add Channel\n/stats - Stats")
     else:
         bot.send_message(user_id, "Use invite link to join channels.")
 
 # --- ADD CHANNEL ---
-
 @bot.message_handler(commands=['add'], func=lambda m: m.from_user.id == ADMIN_ID)
 def add_channel(message):
     msg = bot.send_message(ADMIN_ID, "Forward a message from your channel.")
     bot.register_next_step_handler(msg, get_channel)
-
 
 def get_channel(message):
     if not message.forward_from_chat:
@@ -107,7 +99,6 @@ def get_channel(message):
     ch = message.forward_from_chat
     msg = bot.send_message(ADMIN_ID, "Send plans: 60:10, 1440:50")
     bot.register_next_step_handler(msg, save_channel, ch.id, ch.title)
-
 
 def save_channel(message, ch_id, ch_name):
     try:
@@ -129,13 +120,12 @@ def save_channel(message, ch_id, ch_name):
         bot.send_message(ADMIN_ID, f"Error: {e}")
 
 # --- PAYMENT ---
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith('select_'))
 def select_plan(call):
     _, ch_id, mins = call.data.split('_')
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
 
-    if not ch_data:
+    if not ch_data or mins not in ch_data['plans']:
         return
 
     price = ch_data['plans'][mins]
@@ -152,12 +142,23 @@ def select_plan(call):
         reply_markup=markup
     )
 
-# --- ADMIN APPROVAL ---
-
+# --- PAYMENT REQUEST ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith('paid_'))
 def paid(call):
     _, ch_id, mins = call.data.split('_')
     user = call.from_user
+
+    # Prevent spam
+    existing = users_col.find_one({"user_id": user.id, "pending": True})
+    if existing:
+        bot.answer_callback_query(call.id, "Already requested!")
+        return
+
+    users_col.update_one(
+        {"user_id": user.id},
+        {"$set": {"pending": True}},
+        upsert=True
+    )
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Approve", callback_data=f"app_{user.id}_{ch_id}_{mins}"))
@@ -171,7 +172,6 @@ def paid(call):
     bot.send_message(user.id, "Waiting for approval")
 
 # --- APPROVE ---
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith('app_'))
 def approve(call):
     _, u_id, ch_id, mins = call.data.split('_')
@@ -179,7 +179,9 @@ def approve(call):
 
     existing = users_col.find_one({"user_id": u_id, "channel_id": ch_id})
 
-    if existing and existing.get('expiry', 0) > time.time():
+    now = int(time.time())
+
+    if existing and existing.get('expiry', 0) > now:
         expiry = datetime.fromtimestamp(existing['expiry']) + timedelta(minutes=mins)
     else:
         expiry = datetime.now() + timedelta(minutes=mins)
@@ -190,15 +192,27 @@ def approve(call):
 
     users_col.update_one(
         {"user_id": u_id, "channel_id": ch_id},
-        {"$set": {"expiry": expiry_ts}},
+        {"$set": {"expiry": expiry_ts}, "$unset": {"pending": ""}},
         upsert=True
     )
 
     bot.send_message(u_id, f"Approved! Join: {link.invite_link}")
     bot.edit_message_text("Approved", call.message.chat.id, call.message.message_id)
 
-# --- AUTO REMOVE ---
+# --- REMINDER ---
+def send_reminders():
+    now = int(time.time())
+    soon = now + 600
 
+    users = users_col.find({"expiry": {"$lte": soon, "$gte": now}})
+
+    for u in users:
+        try:
+            bot.send_message(u['user_id'], "⚠️ Expiring in 10 minutes!")
+        except Exception as e:
+            print(e)
+
+# --- AUTO REMOVE ---
 def remove_expired():
     now = int(time.time())
     users = users_col.find({"expiry": {"$lte": now}})
@@ -207,19 +221,46 @@ def remove_expired():
         try:
             bot.ban_chat_member(u['channel_id'], u['user_id'])
             bot.unban_chat_member(u['channel_id'], u['user_id'])
+
             users_col.delete_one({"_id": u['_id']})
-        except:
-            pass
+            print(f"Removed {u['user_id']}")
+        except Exception as e:
+            print(f"Error removing: {e}")
 
-# --- START ---
+# --- STATS ---
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    if message.from_user.id != ADMIN_ID:
+        return
 
-if __name__ == '__main__':
-    keep_alive()
+    total_users = users_col.count_documents({})
+    total_channels = channels_col.count_documents({})
 
+    bot.send_message(
+        ADMIN_ID,
+        f"📊 Stats\nUsers: {total_users}\nChannels: {total_channels}"
+    )
+
+# --- SCHEDULER ---
+def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(remove_expired, 'interval', minutes=1)
+    scheduler.add_job(send_reminders, 'interval', minutes=5)
     scheduler.start()
 
+# --- AUTO RESTART BOT ---
+def run_bot():
+    while True:
+        try:
+            print("Bot running...")
+            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        except Exception as e:
+            print(f"Crashed: {e}")
+            time.sleep(5)
+
+# --- START ---
+if __name__ == '__main__':
+    keep_alive()
+    Thread(target=start_scheduler).start()
     bot.remove_webhook()
-    print("Bot Running...")
-    bot.infinity_polling()
+    run_bot()
